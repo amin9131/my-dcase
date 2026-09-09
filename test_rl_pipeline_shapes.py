@@ -1,8 +1,10 @@
+
 # test_rl_pipeline_shapes.py
 #
-# دراى-ران سبک برای تست زنجیره‌ی: DataGenerator (چند-config) -> RLAdaptiveWrapper (gather)
+# Lightweight dry-run to test the chain:
+# DataGenerator (multi-config) -> RLAdaptiveWrapper (gather)
 # -> MSELoss_ADPIT (per-sample) -> PPORolloutBuffer/ppo_update
-# بدون نیاز به فایل صوتی واقعی یا اجرای batch_feature_extraction.py
+# without requiring real audio files or running batch_feature_extraction.py
 
 import os
 import shutil
@@ -22,33 +24,33 @@ def main():
     tmp_dir = tempfile.mkdtemp(prefix='rl_pipeline_test_')
     try:
         # ---------------------------------------------------------------
-        # STEP 0: پارامترها (task-id=8 -> mic+gcc+multi_accdoa+RL فعال)
+        # STEP 0: Parameters (task-id=8 -> mic+gcc+multi_accdoa+RL enabled)
         # ---------------------------------------------------------------
         params = parameters.get_params('8')
         params['feat_label_dir'] = tmp_dir
-        params['dataset_dir'] = tmp_dir           # فقط برای ساخت مسیرها لازمه، خونده نمی‌شه
+        params['dataset_dir'] = tmp_dir           # Only needed for path construction; it is not read
         params['batch_size'] = 2
         params['label_sequence_length'] = 10
         params['quick_test'] = False
 
-        # بازمحاسبه‌ی پارامترهای مشتق‌شده (چون بعد از get_params دستکاریشون کردیم)
+        # Recalculate derived parameters (because we modified them after get_params)
         feature_label_resolution = int(params['label_hop_len_s'] // params['hop_len_s'])  # = 5
         params['feature_sequence_length'] = params['label_sequence_length'] * feature_label_resolution
         params['t_pool_size'] = [feature_label_resolution, 1, 1]
 
         num_configs = len(params['feat_win_configs'])
         nb_mel_bins = params['nb_mel_bins']
-        nb_ch = 10  # 4 mic + 6 gcc pairs -- مقدار ثابت pipeline فعلی
+        nb_ch = 10  # 4 mic + 6 GCC pairs -- fixed value in the current pipeline
         nb_label_frames = 20
         nb_feat_frames = nb_label_frames * feature_label_resolution  # = 100
         filenames = ['fold1_room1_mix001.npy', 'fold1_room1_mix002.npy']
 
-        print('STEP 0: params آماده شد. num_configs={}, nb_mel_bins={}'.format(num_configs, nb_mel_bins))
+        print('STEP 0: Parameters are ready. num_configs={}, nb_mel_bins={}'.format(num_configs, nb_mel_bins))
 
         # ---------------------------------------------------------------
-        # STEP 1: ساخت فایل‌های ویژگی مصنوعی (هر config = یک مقدار ثابت)
+        # STEP 1: Create synthetic feature files (one constant value per config)
         # ---------------------------------------------------------------
-        feat_cls = cls_feature_class.FeatureClass(params)  # فقط برای استفاده از متدهای نام‌گذاری مسیر
+        feat_cls = cls_feature_class.FeatureClass(params)  # Only used for path-naming methods
 
         for cfg_id in range(num_configs):
             d = feat_cls.get_normalized_feat_dir(cfg_id=cfg_id)
@@ -63,10 +65,10 @@ def main():
             lbl = (np.random.rand(nb_label_frames, 6, 4, params['unique_classes']).astype(np.float32) * 0.1)
             np.save(os.path.join(label_dir, fn), lbl)
 
-        print('STEP 1: فایل‌های مصنوعی ساخته شدن ({} config x {} فایل)'.format(num_configs, len(filenames)))
+        print('STEP 1: Synthetic files created ({} configs x {} files)'.format(num_configs, len(filenames)))
 
         # ---------------------------------------------------------------
-        # STEP 2: DataGenerator -- تست stacking چند-config
+        # STEP 2: DataGenerator -- test multi-config stacking
         # ---------------------------------------------------------------
         data_gen = cls_data_generator.DataGenerator(
             params=params, split=1, shuffle=False, per_file=False, is_eval=False
@@ -78,10 +80,10 @@ def main():
                                 params['feature_sequence_length'], nb_mel_bins)
         assert feat.shape == expected_feat_shape, \
             'feat shape mismatch: got {}, expected {}'.format(feat.shape, expected_feat_shape)
-        print('   ✅ shape feat درست است')
+        print('   ✅ feat shape is correct')
 
         # ---------------------------------------------------------------
-        # STEP 3: RLAdaptiveWrapper -- تست forward + صحت gather
+        # STEP 3: RLAdaptiveWrapper -- test forward + gather correctness
         # ---------------------------------------------------------------
         data_in, data_out = data_gen.get_data_sizes()
         backbone = CST_conformer.CST_former(data_in, data_out, params)
@@ -93,25 +95,25 @@ def main():
         doa, action, log_prob, value, entropy, state = model(x, prev_action=None, greedy=False)
         print('STEP 3: doa shape = {}, expected = {}'.format(doa.shape, tuple(data_out)))
         assert doa.shape == torch.Size(data_out), 'doa shape mismatch'
-        print('   ✅ shape خروجی backbone درست است')
+        print('   ✅ backbone output shape is correct')
 
-        # صحت‌سنجی gather: مقدار انتخاب‌شده باید دقیقا برابر شماره‌ی config انتخابی باشه
+        # Verify gather: the selected value must be exactly equal to the selected config number
         for b in range(x.shape[0]):
             expected_val = float(action[b].item())
             selected_slice = x[b, action[b]]
             actual_val = selected_slice.mean().item()
             assert abs(actual_val - expected_val) < 1e-5, \
-                'gather mismatch در نمونه {}: انتظار {} داشتیم، مقدار واقعی {} بود'.format(b, expected_val, actual_val)
-        print('   ✅ gather درست کار می‌کنه: مقدار انتخاب‌شده دقیقا با action همخوانی داره')
+                'gather mismatch in sample {}: expected {}, got {}'.format(b, expected_val, actual_val)
+        print('   ✅ gather works correctly: selected value exactly matches the action')
 
         # ---------------------------------------------------------------
-        # STEP 4: MSELoss_ADPIT -- تست خروجی per-sample
+        # STEP 4: MSELoss_ADPIT -- test per-sample output
         # ---------------------------------------------------------------
         criterion = seldnet_model.MSELoss_ADPIT()
         loss, loss_per_sample = criterion(doa, target)
         print('STEP 4: loss = {:.4f}, loss_per_sample shape = {}'.format(loss.item(), loss_per_sample.shape))
-        assert loss_per_sample.shape[0] == params['batch_size'], 'loss_per_sample باید طولش برابر batch_size باشه'
-        print('   ✅ per-sample loss درست است')
+        assert loss_per_sample.shape[0] == params['batch_size'], 'loss_per_sample length must equal batch_size'
+        print('   ✅ per-sample loss is correct')
 
         # ---------------------------------------------------------------
         # STEP 5: jitter + reward + PPORolloutBuffer + ppo_update
@@ -122,14 +124,15 @@ def main():
         buffer = rlfs.PPORolloutBuffer()
         buffer.add(state, action, log_prob, value, reward)
 
-        # یک transition دوم مصنوعی (شبیه‌سازی batch بعدی) تا buffer بیشتر از یک نمونه داشته باشه
+        # Add a second synthetic transition (simulating the next batch)
+        # so that the buffer contains more than one sample
         doa2, action2, log_prob2, value2, entropy2, state2 = model(x, prev_action=action.detach(), greedy=False)
         loss2, loss_per_sample2 = criterion(doa2, target)
         jitter2 = rlfs.jitter_penalty(action2, action.detach(), num_configs)
         reward2 = -loss_per_sample2.detach() - params['jitter_penalty_coef'] * jitter2
         buffer.add(state2, action2, log_prob2, value2, reward2)
 
-        print('STEP 5: buffer size قبل از update = {}'.format(len(buffer)))
+        print('STEP 5: buffer size before update = {}'.format(len(buffer)))
 
         rl_optimizer = torch.optim.Adam(model.actor_critic.parameters(), lr=params['rl_lr'])
         rlfs.ppo_update(
@@ -138,11 +141,11 @@ def main():
             ent_coef=params['ppo_ent_coef'], vf_coef=params['ppo_vf_coef'],
             gamma=params['ppo_gamma'], lam=params['ppo_lambda']
         )
-        assert len(buffer) == 0, 'buffer باید بعد از ppo_update خالی بشه'
-        print('   ✅ ppo_update بدون خطا اجرا شد و buffer پاک شد')
+        assert len(buffer) == 0, 'buffer should be empty after ppo_update'
+        print('   ✅ ppo_update executed without errors and the buffer was cleared')
 
         print('\n=================================================')
-        print('همه‌ی مراحل با موفقیت پاس شدن. زنجیره‌ی shape سالمه.')
+        print('All steps passed successfully. The shape pipeline is healthy.')
         print('=================================================')
 
     finally:
