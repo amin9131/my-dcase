@@ -21,6 +21,7 @@ from cls_compute_seld_results import ComputeSELDResults, reshape_3Dto2D
 from SELD_evaluation_metrics import distance_between_cartesian_coordinates
 # import seldnet_model 
 import CST_conformer
+import rl_feature_selector as rlfs
 
 import pytz
 from datetime import datetime
@@ -76,14 +77,25 @@ def test_epoch(data_generator, model, criterion, dcase_output_folder, params, de
     nb_test_batches, test_loss = 0, 0.
     model.eval()
     file_cnt = 0
+    use_rl = params.get('use_rl_adaptive_feat', False)
+    prev_action = None
     with torch.no_grad():
         for data, target in data_generator.generate():
             # load one batch of data
             data, target = torch.tensor(data).to(device).float(), torch.tensor(target).to(device).float()
 
             # process the batch of data based on chosen mode
-            output = model(data)
-            loss = criterion(output, target)
+            if use_rl:
+                output, action, log_prob, value, entropy, state = model(data, prev_action=prev_action, greedy=True)
+                prev_action = action.detach()
+            else:
+                output = model(data)
+
+            if params['multi_accdoa'] is True:
+                loss, _ = criterion(output, target)
+            else:
+                loss = criterion(output, target)
+                
             if params['multi_accdoa'] is True:
                 sed_pred0, doa_pred0, sed_pred1, doa_pred1, sed_pred2, doa_pred2 = get_multi_accdoa_labels(output.detach().cpu().numpy(), params['unique_classes'])
                 sed_pred0 = reshape_3Dto2D(sed_pred0)
@@ -165,29 +177,57 @@ def test_epoch(data_generator, model, criterion, dcase_output_folder, params, de
     return test_loss
 
 
-def train_epoch(data_generator, optimizer, model, criterion, params, device):
+def train_epoch(data_generator, optimizer, model, criterion, params, device,
+                 rl_optimizer=None, rl_buffer=None, prev_action=None):
     nb_train_batches, train_loss = 0, 0.
     model.train()
+    use_rl = params.get('use_rl_adaptive_feat', False)
+
     for data, target in data_generator.generate():
-        # load one batch of data
         data, target = torch.tensor(data).to(device).float(), torch.tensor(target).to(device).float()
         optimizer.zero_grad()
 
-        # process the batch of data based on chosen mode
-        output = model(data)
-        
-        loss = criterion(output, target)
+        if use_rl:
+            output, action, log_prob, value, entropy, state = model(data, prev_action=prev_action, greedy=False)
+        else:
+            output = model(data)
+
+        if params['multi_accdoa'] is True:
+            loss, loss_per_sample = criterion(output, target)
+        else:
+            loss = criterion(output, target)
+            loss_per_sample = None
+
         loss.backward()
         optimizer.step()
-        
+
+        if use_rl:
+            if loss_per_sample is None:
+                raise RuntimeError(
+                    'RL reward نیاز به per-sample loss داره؛ فعلا فقط multi_accdoa=True پشتیبانی می‌شه.'
+                )
+            with torch.no_grad():
+                jitter = rlfs.jitter_penalty(action, prev_action, model.num_configs)
+                reward = -loss_per_sample.detach() - params['jitter_penalty_coef'] * jitter
+
+            rl_buffer.add(state, action, log_prob, value, reward)
+            prev_action = action.detach()
+
+            if len(rl_buffer) >= params['rl_update_every_n_batches']:
+                rlfs.ppo_update(
+                    model.actor_critic, rl_buffer, rl_optimizer,
+                    clip_eps=params['ppo_clip_eps'], epochs=params['ppo_update_epochs'],
+                    minibatch_size=params['ppo_minibatch_size'], ent_coef=params['ppo_ent_coef'],
+                    vf_coef=params['ppo_vf_coef'], gamma=params['ppo_gamma'], lam=params['ppo_lambda']
+                )
+
         train_loss += loss.item()
         nb_train_batches += 1
         if params['quick_test'] and nb_train_batches == 4:
             break
 
     train_loss /= nb_train_batches
-
-    return train_loss
+    return train_loss, prev_action
 
 
 def main(argv):
@@ -284,11 +324,18 @@ def main(argv):
 
         # Collect i/o data size and load model configuration
         data_in, data_out = data_gen_train.get_data_sizes()
-        # model = seldnet_model.SeldModel(data_in, data_out, params).to(device)
-        model = CST_conformer.CST_former(data_in, data_out, params).to(device)
+        backbone = CST_conformer.CST_former(data_in, data_out, params).to(device)
+
+        use_rl = params.get('use_rl_adaptive_feat', False)
+        if use_rl:
+            num_configs = len(params['feat_win_configs'])
+            model = rlfs.RLAdaptiveWrapper(backbone, num_configs, hidden=params.get('rl_hidden_dim', 32)).to(device)
+        else:
+            model = backbone
+
         if params['finetune_mode']:
             print('Running in finetuning mode. Initializing the model to the weights - {}'.format(params['pretrained_model_weights']))
-            model.load_state_dict(torch.load(params['pretrained_model_weights'], map_location='cpu'))
+            (model.backbone if use_rl else model).load_state_dict(torch.load(params['pretrained_model_weights'], map_location='cpu'))
 
         print('---------------- SELD-net -------------------')
         print('FEATURES:\n\tdata_in: {}\n\tdata_out: {}\n'.format(data_in, data_out))
@@ -311,7 +358,16 @@ def main(argv):
         patience_cnt = 0
 
         nb_epoch = 2 if params['quick_test'] else params['nb_epochs']
-        optimizer = optim.Adam(model.parameters(), lr=params['lr'])
+        if use_rl:
+            optimizer = optim.Adam(model.backbone.parameters(), lr=params['lr'])
+            rl_optimizer = optim.Adam(model.actor_critic.parameters(), lr=params.get('rl_lr', 1e-3))
+            rl_buffer = rlfs.PPORolloutBuffer()
+        else:
+            optimizer = optim.Adam(model.parameters(), lr=params['lr'])
+            rl_optimizer, rl_buffer = None, None
+
+        prev_action = None   # بین epochها رد می‌شه
+
         if params['lr_scheduler'] == 'ReduceLROnPlateau':
             # تعریف ReduceLROnPlateau
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=5, verbose=True)
@@ -381,7 +437,10 @@ def main(argv):
             # TRAINING
             # ---------------------------------------------------------------------
             start_time = time.time()
-            train_loss = train_epoch(data_gen_train, optimizer, model, criterion, params, device)
+            train_loss, prev_action = train_epoch(
+                data_gen_train, optimizer, model, criterion, params, device,
+                rl_optimizer=rl_optimizer, rl_buffer=rl_buffer, prev_action=prev_action
+            )
             train_time = time.time() - start_time
 
             # ---------------------------------------------------------------------
