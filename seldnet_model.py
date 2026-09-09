@@ -24,7 +24,10 @@ class MSELoss_ADPIT(object):
             output: [batch_size, frames, num_track*num_axis*num_class=3*3*12]
             target: [batch_size, frames, num_track_dummy=6, num_axis=4, num_class=12]
         Return:
-            loss: scalar
+            loss: scalar — میانگین کل batch (برای backprop معمولی SELD)
+            loss_per_sample: [batch_size] — loss هر نمونه، قبل از میانگین روی batch
+                              (ورودی reward برای RL wrapper؛ کاملاً differentiable نیست چون .detach()
+                              باید در سمت train_seldnet.py روش اعمال بشه، نه اینجا)
         """
         target_A0 = target[:, :, 0, 0:1, :] * target[:, :, 0, 1:, :]  # A0, no ov from the same class, [batch_size, frames, num_axis(act)=1, num_class=12] * [batch_size, frames, num_axis(XYZ)=3, num_class=12]
         target_B0 = target[:, :, 1, 0:1, :] * target[:, :, 1, 1:, :]  # B0, ov with 2 sources from the same class
@@ -81,21 +84,24 @@ class MSELoss_ADPIT(object):
                          loss_12), dim=0),
             dim=0).indices
 
-        loss = (loss_0 * (loss_min == 0) +
-                loss_1 * (loss_min == 1) +
-                loss_2 * (loss_min == 2) +
-                loss_3 * (loss_min == 3) +
-                loss_4 * (loss_min == 4) +
-                loss_5 * (loss_min == 5) +
-                loss_6 * (loss_min == 6) +
-                loss_7 * (loss_min == 7) +
-                loss_8 * (loss_min == 8) +
-                loss_9 * (loss_min == 9) +
-                loss_10 * (loss_min == 10) +
-                loss_11 * (loss_min == 11) +
-                loss_12 * (loss_min == 12)).mean()
+        loss_selected = (loss_0 * (loss_min == 0) +
+                          loss_1 * (loss_min == 1) +
+                          loss_2 * (loss_min == 2) +
+                          loss_3 * (loss_min == 3) +
+                          loss_4 * (loss_min == 4) +
+                          loss_5 * (loss_min == 5) +
+                          loss_6 * (loss_min == 6) +
+                          loss_7 * (loss_min == 7) +
+                          loss_8 * (loss_min == 8) +
+                          loss_9 * (loss_min == 9) +
+                          loss_10 * (loss_min == 10) +
+                          loss_11 * (loss_min == 11) +
+                          loss_12 * (loss_min == 12))  # shape: (batch, frames, num_class) — batch دست‌نخورده
 
-        return loss
+        loss_per_sample = loss_selected.mean(dim=(1, 2))  # (batch,) — برای reward
+        loss = loss_per_sample.mean()                     # (,) — برای backward معمولی SELD
+
+        return loss, loss_per_sample
 
 # class firstConvBlock(nn.Module):
 #     def __init__(self, in_channels, out_channels, kernel_size=(3,3), stride=(1,1), padding=(1,1)):
