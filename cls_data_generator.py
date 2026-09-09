@@ -23,7 +23,18 @@ class DataGenerator(object):
         self._shuffle = shuffle
         self._feat_cls = cls_feature_class.FeatureClass(params=params, is_eval=self._is_eval)
         self._label_dir = self._feat_cls.get_label_dir()
-        self._feat_dir = self._feat_cls.get_normalized_feat_dir()
+
+        # --- RL multi-resolution support ---
+        self._feat_win_configs = params.get('feat_win_configs', None)
+        self._multi_config_mode = bool(self._feat_win_configs)
+        self._num_configs = len(self._feat_win_configs) if self._multi_config_mode else 1
+        if self._multi_config_mode:
+            self._feat_dirs = [self._feat_cls.get_normalized_feat_dir(cfg_id=c) for c in range(self._num_configs)]
+        else:
+            self._feat_dirs = [self._feat_cls.get_normalized_feat_dir()]
+        self._feat_dir = self._feat_dirs[0]   # نگه داشته شده برای backward-compat (لاگ‌گیری و شناسایی فایل‌ها)
+        # --- end RL support ---
+        
         self._multi_accdoa = params['multi_accdoa']
 
         self._filenames_list = list()
@@ -122,88 +133,71 @@ class DataGenerator(object):
         if self._shuffle:
             random.shuffle(self._filenames_list)
 
-        # Ideally this should have been outside the while loop. But while generating the test data we want the data
-        # to be the same exactly for all epoch's hence we keep it here.
-        self._circ_buf_feat = deque()
+        # یک circular buffer به ازای هر config ویژگی (طول لیست = 1 در حالت غیر-RL، برای سازگاری با گذشته)
+        self._circ_buf_feat_list = [deque() for _ in range(self._num_configs)]
         self._circ_buf_label = deque()
 
         file_cnt = 0
         if self._is_eval:
             for i in range(self._nb_total_batches):
-                # load feat and label to circular buffer. Always maintain atleast one batch worth feat and label in the
-                # circular buffer. If not keep refilling it.
-                while len(self._circ_buf_feat) < self._feature_batch_seq_len:
-                    temp_feat = np.load(os.path.join(self._feat_dir, self._filenames_list[file_cnt]))
+                while len(self._circ_buf_feat_list[0]) < self._feature_batch_seq_len:
+                    for cfg_idx, feat_dir in enumerate(self._feat_dirs):
+                        temp_feat = np.load(os.path.join(feat_dir, self._filenames_list[file_cnt]))
 
-                    for row_cnt, row in enumerate(temp_feat):
-                        self._circ_buf_feat.append(row)
+                        for row in temp_feat:
+                            self._circ_buf_feat_list[cfg_idx].append(row)
 
-                    # If self._per_file is True, this returns the sequences belonging to a single audio recording
-                    if self._per_file:
-                        extra_frames = self._feature_batch_seq_len - temp_feat.shape[0]
-                        extra_feat = np.ones((extra_frames, temp_feat.shape[1])) * 1e-6
-
-                        for row_cnt, row in enumerate(extra_feat):
-                            self._circ_buf_feat.append(row)
+                        if self._per_file:
+                            extra_frames = self._feature_batch_seq_len - temp_feat.shape[0]
+                            extra_feat = np.ones((extra_frames, temp_feat.shape[1])) * 1e-6
+                            for row in extra_feat:
+                                self._circ_buf_feat_list[cfg_idx].append(row)
 
                     file_cnt = file_cnt + 1
 
-                # Read one batch size from the circular buffer
-                feat = np.zeros((self._feature_batch_seq_len, self._nb_mel_bins * self._nb_ch))
-                for j in range(self._feature_batch_seq_len):
-                    feat[j, :] = self._circ_buf_feat.popleft()
-                feat = np.reshape(feat, (self._feature_batch_seq_len, self._nb_ch, self._nb_mel_bins))
-
-                # Split to sequences
-                feat = self._split_in_seqs(feat, self._feature_seq_len)
-                feat = np.transpose(feat, (0, 2, 1, 3))
-
-                yield feat
+                feat = self._pop_batch_multi_config()
+                yield self._collapse_config_dim(feat)
 
         else:
             for i in range(self._nb_total_batches):
 
-                # load feat and label to circular buffer. Always maintain atleast one batch worth feat and label in the
-                # circular buffer. If not keep refilling it.
-                while len(self._circ_buf_feat) < self._feature_batch_seq_len:
-                    temp_feat = np.load(os.path.join(self._feat_dir, self._filenames_list[file_cnt]))
+                while len(self._circ_buf_feat_list[0]) < self._feature_batch_seq_len:
+                    # لیبل رو اول می‌خونیم چون crop کردن feature به طول اون وابسته‌ست
                     temp_label = np.load(os.path.join(self._label_dir, self._filenames_list[file_cnt]))
-                    if not self._per_file: 
-                        # Inorder to support variable length features, and labels of different resolution. 
-                        # We remove all frames in features and labels matrix that are outside 
-                        # the multiple of self._label_seq_len and self._feature_seq_len. Further we do this only in training.
+                    if not self._per_file:
                         temp_label = temp_label[:temp_label.shape[0] - (temp_label.shape[0] % self._label_seq_len)]
-                        temp_mul = temp_label.shape[0]//self._label_seq_len
-                        temp_feat = temp_feat[:temp_mul*self._feature_seq_len, :]
+                    temp_mul = temp_label.shape[0] // self._label_seq_len
 
-                    for f_row in temp_feat:
-                        self._circ_buf_feat.append(f_row)
+                    for cfg_idx, feat_dir in enumerate(self._feat_dirs):
+                        temp_feat = np.load(os.path.join(feat_dir, self._filenames_list[file_cnt]))
+                        if not self._per_file:
+                            temp_feat = temp_feat[:temp_mul * self._feature_seq_len, :]
+
+                        for f_row in temp_feat:
+                            self._circ_buf_feat_list[cfg_idx].append(f_row)
+
+                        if self._per_file:
+                            feat_extra_frames = self._feature_batch_seq_len - temp_feat.shape[0]
+                            extra_feat = np.ones((feat_extra_frames, temp_feat.shape[1])) * 1e-6
+                            for f_row in extra_feat:
+                                self._circ_buf_feat_list[cfg_idx].append(f_row)
+
+                    # لیبل مستقل از config است، فقط یک‌بار push می‌شه
                     for l_row in temp_label:
                         self._circ_buf_label.append(l_row)
-                    
-                    # If self._per_file is True, this returns the sequences belonging to a single audio recording
                     if self._per_file:
-                        feat_extra_frames = self._feature_batch_seq_len - temp_feat.shape[0]
-                        extra_feat = np.ones((feat_extra_frames, temp_feat.shape[1])) * 1e-6
-
                         label_extra_frames = self._label_batch_seq_len - temp_label.shape[0]
                         if self._multi_accdoa is True:
                             extra_labels = np.zeros((label_extra_frames, self._num_track_dummy, self._num_axis, self._num_class))
                         else:
                             extra_labels = np.zeros((label_extra_frames, temp_label.shape[1]))
-
-                        for f_row in extra_feat:
-                            self._circ_buf_feat.append(f_row)
                         for l_row in extra_labels:
                             self._circ_buf_label.append(l_row)
 
                     file_cnt = file_cnt + 1
 
-                # Read one batch size from the circular buffer
-                feat = np.zeros((self._feature_batch_seq_len, self._nb_mel_bins * self._nb_ch))
-                for j in range(self._feature_batch_seq_len):
-                    feat[j, :] = self._circ_buf_feat.popleft()
-                feat = np.reshape(feat, (self._feature_batch_seq_len, self._nb_ch, self._nb_mel_bins))
+                feat = self._pop_batch_multi_config()
+                feat = self._collapse_config_dim(feat)
 
                 if self._multi_accdoa is True:
                     label = np.zeros((self._label_batch_seq_len, self._num_track_dummy, self._num_axis, self._num_class))
@@ -213,10 +207,7 @@ class DataGenerator(object):
                     label = np.zeros((self._label_batch_seq_len, self._label_len))
                     for j in range(self._label_batch_seq_len):
                         label[j, :] = self._circ_buf_label.popleft()
-                # Split to sequences
-                feat = self._split_in_seqs(feat, self._feature_seq_len)
-                feat = np.transpose(feat, (0, 2, 1, 3))
-                
+
                 label = self._split_in_seqs(label, self._label_seq_len)
                 if self._multi_accdoa is True:
                     pass
@@ -226,6 +217,34 @@ class DataGenerator(object):
                     label = mask * label[:, :, self._nb_classes:]
 
                 yield feat, label
+
+    def _pop_batch_multi_config(self):
+        """
+        یک batch کامل رو از circular buffer هر config جدا pop می‌کنه، به شکل
+        (n_seqs, ch, seq_len, mel_bins) در می‌آره، و روی محور جدید config استک می‌کنه
+        -> خروجی: (n_seqs, num_configs, ch, seq_len, mel_bins)
+        """
+        feat_per_cfg = []
+        for cfg_idx in range(self._num_configs):
+            feat_c = np.zeros((self._feature_batch_seq_len, self._nb_mel_bins * self._nb_ch))
+            for j in range(self._feature_batch_seq_len):
+                feat_c[j, :] = self._circ_buf_feat_list[cfg_idx].popleft()
+            feat_c = np.reshape(feat_c, (self._feature_batch_seq_len, self._nb_ch, self._nb_mel_bins))
+            feat_c = self._split_in_seqs(feat_c, self._feature_seq_len)
+            feat_c = np.transpose(feat_c, (0, 2, 1, 3))  # (n_seqs, ch, seq_len, mel_bins)
+            feat_per_cfg.append(feat_c)
+        return np.stack(feat_per_cfg, axis=1)  # (n_seqs, num_configs, ch, seq_len, mel_bins)
+
+    def _collapse_config_dim(self, feat):
+        """
+        Backward compatibility: وقتی feat_win_configs تنظیم نشده (حالت غیر-RL)،
+        محور config حذف می‌شه تا شکل خروجی دقیقاً مثل قبل از این تغییر
+        (n_seqs, ch, seq_len, mel_bins) بمونه و کد فعلی train_seldnet.py/مدل‌ها بشکنه نه.
+        وقتی حالت چند-config فعاله، محور config نگه داشته می‌شه تا RL wrapper ازش استفاده کنه.
+        """
+        if self._multi_config_mode:
+            return feat
+        return feat[:, 0]
 
     def _split_in_seqs(self, data, _seq_len):
         if len(data.shape) == 1:
