@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange
 import Encoder_module 
 
+from env_conditioning import FiLM, ENV_DIM, estimate_environment
+
 
 class CST_attention(torch.nn.Module):
     def __init__(self, temp_embed_dim, params):
@@ -18,6 +20,10 @@ class CST_attention(torch.nn.Module):
         self.temp_embed_dim = temp_embed_dim
         self.nb_ch = 10
 
+        self.use_film = params.get('use_env_film', False)
+        env_dim = params.get('env_vector_dim', ENV_DIM)
+        film_hidden = params.get('film_hidden_dim', 32)
+
 
         # Channel attention w. Divided Channel Attention (DCA) ---------------------------------------------#
         if self.ChAtten_dca:
@@ -28,6 +34,12 @@ class CST_attention(torch.nn.Module):
             if self.linear_layer:
                 self.ch_linear = nn.Linear(self.temp_embed_dim, self.temp_embed_dim)
 
+        # Environment-conditioned FiLM after channel attention. Registered only when enabled,
+        # so state_dict keys are unchanged (and old checkpoints keep loading) when use_env_film=False.
+        if self.use_film:
+            self.ch_film = FiLM(env_dim=env_dim, num_features=self.temp_embed_dim,
+                                 hidden_dim=film_hidden, channel_dim=2)
+
         # temporal attention -----------------------------------------------------------------------------------#
         self.embed_dim_4_freq_attn = params['nb_cnn2d_filt'] # Update the temp embedding if freq attention is applied
         # self.temp_mhsa = nn.MultiheadAttention(embed_dim=self.embed_dim_4_freq_attn if params['FreqAtten'] else self.embed_dim,
@@ -36,6 +48,11 @@ class CST_attention(torch.nn.Module):
         self.temp_layer_norm = nn.LayerNorm(self.temp_embed_dim)
         if self.linear_layer:
             self.temp_linear = nn.Linear(self.temp_embed_dim, self.temp_embed_dim)
+
+        # Environment-conditioned FiLM after temporal attention (same opt-in rule as above).
+        if self.use_film:
+            self.temp_film = FiLM(env_dim=env_dim, num_features=self.temp_embed_dim,
+                                   hidden_dim=film_hidden, channel_dim=2)
 
         self.temp_gru = torch.nn.GRU(input_size= self.embed_dim_4_freq_attn, hidden_size=self.embed_dim_4_freq_attn,
                                 num_layers=params['nb_rnn_layers'], batch_first=True,
@@ -58,7 +75,7 @@ class CST_attention(torch.nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self,x, M, C, T, F):
+    def forward(self, x, M, C, T, F, env_vector=None):
         # x shape = 32(batch_size) * 50 * 1280
         
 
@@ -78,6 +95,8 @@ class CST_attention(torch.nn.Module):
         if self.dropout_rate:
             xc = self.drop_out(xc)
         xc = self.ch_layer_norm(xc)
+        if self.use_film:
+            xc = self.ch_film(xc, env_vector)
 
         # temporal attention
         xt = rearrange(xc, ' b t (f m c) -> (b f m) t c', m=M, f=F).contiguous() # 640*50*64
@@ -96,6 +115,8 @@ class CST_attention(torch.nn.Module):
         if self.dropout_rate:
             xt = self.drop_out(xt)
         x = self.temp_layer_norm(xt)
+        if self.use_film:
+            x = self.temp_film(x, env_vector)
 
         return x
 
@@ -114,7 +135,7 @@ class CST_encoder(torch.nn.Module):
         ) for _ in range(n_layers)] # n_layers = 2
         )
 
-    def forward(self, x):
+    def forward(self, x, env_vector=None):
         B, C, T, F = x.size() # 320(= batch_size * nb_ch) * 64 * 50 * 2
         # print('B C T F =', B, C, T, F)
         M = self.nb_ch # Number of Microphone Channels
@@ -129,7 +150,7 @@ class CST_encoder(torch.nn.Module):
         #     x = rearrange(x, 'b c t f -> b t (f c)').contiguous()
 
         for block in self.block_list:
-            x = block(x, M, C, T, F)
+            x = block(x, M, C, T, F, env_vector)
 
         return x
 
@@ -175,6 +196,7 @@ class CST_former(torch.nn.Module):
         self.nb_classes = params['unique_classes']
         self.t_pooling_loc = params["t_pooling_loc"]
         self.ch_attn_dca = params['ChAtten_DCA']
+        self.use_env_film = params.get('use_env_film', False)
         self.encoder = Encoder_module.Encoder(in_feat_shape, params)
 
         self.conv_block_freq_dim = int(np.floor(in_feat_shape[-1] / np.prod(params['f_pool_size']))) # 64 / 4*4*2 = 2
@@ -213,14 +235,27 @@ class CST_former(torch.nn.Module):
         B, M, T, F = x.size() # B = 16, M = 10, T = 250, F = 64
         # print(' B M T F = ', B, M, T, F)
 
+        # Environment vector is estimated once, on the *original* (un-collapsed) multichannel
+        # block, so it reflects the whole recording rather than a single mic-channel slice.
+        env_vector = None
+        env_vector_for_encoder = None
+        if self.use_env_film:
+            env_vector = estimate_environment(x)  # (B, ENV_DIM)
+
         if self.ch_attn_dca:
             x = rearrange(x, 'b m t f -> (b m) 1 t f', b=B, m=M, t=T, f=F).contiguous() # 160 * 1 * 250 * 64
+            if env_vector is not None:
+                # The encoder operates on the collapsed (b*m) batch. Repeat each recording's
+                # env vector M times so index (b*M + m) lines up with the rearrange above
+                # (row-major: for each b, M consecutive rows -> repeat_interleave, not repeat).
+                env_vector_for_encoder = env_vector.repeat_interleave(M, dim=0)
+        else:
+            env_vector_for_encoder = env_vector
 
-        
         # print('x shape = ', x.shape)
-        x = self.encoder(x) # OUT : [(b m) c t f] if ch_attn_dca else [b c t f]
+        x = self.encoder(x, env_vector_for_encoder) # OUT : [(b m) c t f] if ch_attn_dca else [b c t f]
         # print('x shape after conv encoder = ', x.shape)
-        x = self.attention_stage(x)
+        x = self.attention_stage(x, env_vector) # attention operates at the true batch size B
 
         doa = self.fc_layer(x)
 

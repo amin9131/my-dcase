@@ -68,6 +68,14 @@ def get_params(argv='1'):
         ppo_gamma=0.0,     # تک-گامی -- چون shuffle باعث می‌شه پیوستگی lane بین batchها برقرار نباشه (بحث قبلی)
         ppo_lambda=0.0,
 
+        # Environment-conditioned FiLM (differentiable, opt-in) -- see env_conditioning.py.
+        # Independent of the RL selector above: RL still picks the STFT window/filterbank
+        # (a non-differentiable, discrete choice), while FiLM lets the backbone's internal
+        # processing adapt continuously to blind noise/reverb estimates via backprop.
+        use_env_film=False,     # فعال‌سازی شرطی‌سازی FiLM بر اساس شرایط محیط (نویز/پژواک تخمینی)
+        env_vector_dim=5,       # ابعاد بردار محیطی خروجی estimate_environment() -- باید با ENV_DIM هم‌خوان بمونه
+        film_hidden_dim=32,     # ابعاد لایه‌ی پنهان MLP تولیدکننده‌ی gamma/beta در هر لایه‌ی FiLM
+
         # DNN MODEL PARAMETERS
         label_sequence_length=50,    # Feature sequence length
         batch_size = 16,              # Batch size
@@ -157,6 +165,15 @@ def get_params(argv='1'):
         params['dataset'] = 'mic'
         params['use_salsalite'] = True
         params['multi_accdoa'] = True
+
+    elif argv == '9':
+        print("MIC + GCC + multi ACCDOA + RL adaptive feature extraction + env-conditioned FiLM\n")
+        params['quick_test'] = False
+        params['dataset'] = 'mic'
+        params['use_salsalite'] = False
+        params['multi_accdoa'] = True
+        params['use_rl_adaptive_feat'] = True
+        params['use_env_film'] = True
 
     elif argv == '999':
         print("QUICK TEST MODE\n")
