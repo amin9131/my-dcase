@@ -53,6 +53,20 @@ def get_params(argv='1'):
         CMT_block = True,          # Use of LPU & IRFNN
         CMT_split = False,          # Apply LPU & IRFNN on S, T attention layers independently
 
+        # RL adaptive feature-extraction params (PPO-based window/filterbank selector)
+        use_rl_adaptive_feat=False,     # اگر True باشه، RLAdaptiveWrapper به‌جای backbone خام استفاده می‌شه
+        feat_win_configs=[10, 20, 40, 80],   # ms -- کاندیدهای طول پنجره STFT (باید با extraction هم‌خوان باشه)
+        rl_hidden_dim=32,
+        rl_lr=1e-3,
+        jitter_penalty_coef=0.05,
+        rl_update_every_n_batches=50,
+        ppo_clip_eps=0.2,
+        ppo_update_epochs=4,
+        ppo_minibatch_size=64,
+        ppo_ent_coef=0.01,
+        ppo_vf_coef=0.5,
+        ppo_gamma=0.0,     # تک-گامی -- چون shuffle باعث می‌شه پیوستگی lane بین batchها برقرار نباشه (بحث قبلی)
+        ppo_lambda=0.0,
 
         # DNN MODEL PARAMETERS
         label_sequence_length=50,    # Feature sequence length
@@ -128,6 +142,14 @@ def get_params(argv='1'):
         params['dataset'] = 'mic'
         params['use_salsalite'] = False
         params['multi_accdoa'] = True
+
+    elif argv == '8':
+        print("MIC + GCC + multi ACCDOA + RL adaptive feature extraction\n")
+        params['quick_test'] = False
+        params['dataset'] = 'mic'
+        params['use_salsalite'] = False
+        params['multi_accdoa'] = True
+        params['use_rl_adaptive_feat'] = True
 
     elif argv == '7':
         print("MIC + SALSA + multi ACCDOA\n")
