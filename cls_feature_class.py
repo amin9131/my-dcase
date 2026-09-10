@@ -15,6 +15,9 @@ import shutil
 import math
 import wave
 import contextlib
+import threading
+import msvcrt
+import time
 
 
 def nCr(n, r):
@@ -99,6 +102,132 @@ class FeatureClass:
         self._nb_unique_classes = params['unique_classes']
 
         self._filewise_frames = {}
+        self._pause_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._keyboard_thread = None
+        self._user_stop_requested = False
+
+    # def _keyboard_listener(self):
+    #     """
+    #     Listen for keyboard commands in a background thread.
+
+    #     P -> pause / resume
+    #     Q -> stop
+    #     """
+
+    #     while not self._stop_event.is_set():
+
+    #         if msvcrt.kbhit():
+
+    #             key = msvcrt.getwch().lower()
+
+    #             if key == 'p':
+
+    #                 if not self._pause_event.is_set():
+
+    #                     self._pause_event.set()
+
+    #                     print('\n')
+    #                     print('==================================================')
+    #                     print('PAUSE requested')
+    #                     print('Current file will finish.')
+    #                     print('Extraction will pause before the next file.')
+    #                     print('Press P to resume or Q to stop.')
+    #                     print('==================================================')
+
+    #                 else:
+
+    #                     self._pause_event.clear()
+
+    #                     print('\n')
+    #                     print('==================================================')
+    #                     print('RESUMED')
+    #                     print('==================================================')
+
+    #             elif key == 'q':
+
+    #                 self._user_stop_requested = True
+    #                 self._stop_event.set()
+
+    #                 print('\n')
+    #                 print('==================================================')
+    #                 print('STOP requested')
+    #                 print('Current file will finish.')
+    #                 print('Program will stop before the next file.')
+    #                 print('==================================================')
+
+    #         time.sleep(0.1)
+
+    def is_stop_requested(self):
+        return self._user_stop_requested     
+    
+    def _keyboard_listener(self):
+        """
+        Test keyboard listener.
+        """
+
+        print('Keyboard listener started.')
+
+        while not self._stop_event.is_set():
+
+            if msvcrt.kbhit():
+
+                key = msvcrt.getwch()
+
+                print(
+                    '\nKEY RECEIVED:',
+                    repr(key)
+                )
+
+                if key.lower() == 'p':
+
+                    if not self._pause_event.is_set():
+
+                        self._pause_event.set()
+
+                        print('>>> PAUSE')
+
+                    else:
+
+                        self._pause_event.clear()
+
+                        print('>>> RESUME')
+
+                elif key.lower() == 'q':
+
+                    self._user_stop_requested = True
+                    self._stop_event.set()
+
+                    print('>>> STOP')
+
+            time.sleep(0.1)
+
+    def _wait_if_paused(self):
+        """
+        Wait here while extraction is paused.
+
+        P -> resume
+        Q -> stop
+        """
+
+        while self._pause_event.is_set():
+
+            if self._stop_event.is_set():
+                raise KeyboardInterrupt
+
+            time.sleep(0.2)
+
+        if self._stop_event.is_set():
+            raise KeyboardInterrupt
+
+    def _wait_for_pause_or_continue(self):
+        """
+        Wait while the extraction is paused.
+
+        This function is called between files.
+        """
+
+        self._check_pause()
 
     def _compute_mel_wts(self, nfft):
         return librosa.filters.mel(sr=self._fs, n_fft=nfft, n_mels=self._nb_mel_bins).T
@@ -371,46 +500,251 @@ class FeatureClass:
             print('ERROR: Unknown dataset format {}'.format(self._dataset))
             exit()
 
+        
         if feat is not None:
             print('{}: {}, {}'.format(_file_cnt, os.path.basename(_wav_path), feat.shape))
+            feat = feat.astype(np.float32)
             np.save(_feat_path, feat)
             
     def extract_all_feature(self, cfg_id=None):
-        # setting up folders
-        # print('in extract_all_feature function')
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self._user_stop_requested = False
+
         self._feat_dir = self.get_unnormalized_feat_dir(cfg_id)
         create_folder(self._feat_dir)
-        from multiprocessing import Pool
-        import time
+
         start_s = time.time()
-        # extraction starts
+
         print('Extracting spectrogram:')
         print('\t\taud_dir {}\n\t\tdesc_dir {}\n\t\tfeat_dir {}'.format(
-            self._aud_dir, self._desc_dir, self._feat_dir))
-        arg_list = []
-        
-        if(self._is_eval):
-            for file_cnt, file_name in enumerate(os.listdir(self._aud_dir)):
-                wav_filename = '{}.wav'.format(file_name.split('.')[0])
-                wav_path = os.path.join(self._aud_dir, wav_filename)
-                feat_path = os.path.join(self._feat_dir, '{}.npy'.format(wav_filename.split('.')[0]))
-                self.extract_file_feature((file_cnt, wav_path, feat_path), cfg_id=cfg_id)
-                arg_list.append((file_cnt, wav_path, feat_path))
+            self._aud_dir,
+            self._desc_dir,
+            self._feat_dir
+        ))
+
+        print('\nKeyboard control:')
+        print('    P = pause / resume')
+        print('    Q = stop')
+        print()
+
+        # -------------------------------------------------------------
+        # Reset control flags for this extraction run
+        # -------------------------------------------------------------
+        self._pause_event.clear()
+        self._stop_event.clear()
+
+        # -------------------------------------------------------------
+        # Start keyboard listener
+        # -------------------------------------------------------------
+        self._keyboard_thread = threading.Thread(
+            target=self._keyboard_listener,
+            daemon=True
+        )
+
+        self._keyboard_thread.start()
+
+        try:
+
+            if self._is_eval:
+
+                for file_cnt, file_name in enumerate(
+                        os.listdir(self._aud_dir)):
+
+                    # -------------------------------------------------
+                    # Wait here if P was pressed
+                    # -------------------------------------------------
+                    self._wait_if_paused()
+
+                    # -------------------------------------------------
+                    # Stop before starting a new file
+                    # -------------------------------------------------
+                    if self._stop_event.is_set():
+                        print('\nExtraction stopped.')
+                        break
+
+                    wav_filename = '{}.wav'.format(
+                        file_name.split('.')[0]
+                    )
+
+                    wav_path = os.path.join(
+                        self._aud_dir,
+                        wav_filename
+                    )
+
+                    feat_path = os.path.join(
+                        self._feat_dir,
+                        '{}.npy'.format(
+                            wav_filename.split('.')[0]
+                        )
+                    )
+
+                    # -------------------------------------------------
+                    # Skip already extracted feature
+                    # -------------------------------------------------
+                    if os.path.exists(feat_path):
+
+                        print(
+                            '{}: {}, already exists -> skip'.format(
+                                file_cnt,
+                                os.path.basename(wav_path)
+                            )
+                        )
+
+                        continue
+
+                    # -------------------------------------------------
+                    # Extract current file
+                    # -------------------------------------------------
+                    # print(
+                    #     '\n{}: extracting {}'.format(
+                    #         file_cnt,
+                    #         os.path.basename(wav_path)
+                    #     )
+                    # )
+
+                    self.extract_file_feature(
+                        (file_cnt, wav_path, feat_path),
+                        cfg_id=cfg_id
+                    )
+
+                    # -------------------------------------------------
+                    # Check stop after current file
+                    # -------------------------------------------------
+                    if self._stop_event.is_set():
+
+                        print(
+                            '\nCurrent file finished.'
+                        )
+
+                        print(
+                            'Stopping before the next file.'
+                        )
+
+                        break
+
+            else:
+
+                for sub_folder in os.listdir(self._aud_dir):
+
+                    # -------------------------------------------------
+                    # Check stop between folders
+                    # -------------------------------------------------
+                    if self._stop_event.is_set():
+                        break
+
+                    loc_aud_folder = os.path.join(
+                        self._aud_dir,
+                        sub_folder
+                    )
+
+                    for file_cnt, file_name in enumerate(
+                            os.listdir(loc_aud_folder)):
+
+                        # ---------------------------------------------
+                        # Wait if paused
+                        # ---------------------------------------------
+                        self._wait_if_paused()
+
+                        # ---------------------------------------------
+                        # Stop before starting next file
+                        # ---------------------------------------------
+                        if self._stop_event.is_set():
+                            break
+
+                        wav_filename = '{}.wav'.format(
+                            file_name.split('.')[0]
+                        )
+
+                        wav_path = os.path.join(
+                            loc_aud_folder,
+                            wav_filename
+                        )
+
+                        feat_path = os.path.join(
+                            self._feat_dir,
+                            '{}.npy'.format(
+                                wav_filename.split('.')[0]
+                            )
+                        )
+
+                        # ---------------------------------------------
+                        # Skip existing feature
+                        # ---------------------------------------------
+                        if os.path.exists(feat_path):
+
+                            print(
+                                '{}: {}, already exists -> skip'.format(
+                                    file_cnt,
+                                    os.path.basename(wav_path)
+                                )
+                            )
+
+                            continue
+
+                        # ---------------------------------------------
+                        # Extract current file
+                        # ---------------------------------------------
+                        # print(
+                        #     '\n{}: extracting {}'.format(
+                        #         file_cnt,
+                        #         os.path.basename(wav_path)
+                        #     )
+                        # )
+
+                        self.extract_file_feature(
+                            (file_cnt, wav_path, feat_path),
+                            cfg_id=cfg_id
+                        )
+
+                        # ---------------------------------------------
+                        # Check stop after current file
+                        # ---------------------------------------------
+                        if self._stop_event.is_set():
+
+                            print(
+                                '\nCurrent file finished.'
+                            )
+
+                            print(
+                                'Stopping before the next file.'
+                            )
+
+                            break
+
+                    if self._stop_event.is_set():
+                        break
+
+        except KeyboardInterrupt:
+
+            print('\n')
+            print('==================================================')
+            print('Feature extraction stopped.')
+            print('Already completed .npy files are preserved.')
+            print('Run extraction again to continue.')
+            print('==================================================')
+
+        finally:
+            if self._keyboard_thread is not None:
+                self._keyboard_thread.join(timeout=1.0)
+        # -------------------------------------------------------------
+        # Final status
+        # -------------------------------------------------------------
+        if self._stop_event.is_set():
+            print('\nFeature extraction stopped.')
         else:
-            for sub_folder in os.listdir(self._aud_dir):
-                loc_aud_folder = os.path.join(self._aud_dir, sub_folder)
-                for file_cnt, file_name in enumerate(os.listdir(loc_aud_folder)):
-                    wav_filename = '{}.wav'.format(file_name.split('.')[0])
-                    wav_path = os.path.join(loc_aud_folder, wav_filename)
-                    feat_path = os.path.join(self._feat_dir, '{}.npy'.format(wav_filename.split('.')[0]))
-                    self.extract_file_feature((file_cnt, wav_path, feat_path), cfg_id=cfg_id)
-                    arg_list.append((file_cnt, wav_path, feat_path))
-        # print(' extract_all_featuer is finished')
-#        with Pool() as pool:
-#            result = pool.map(self.extract_file_feature, iterable=arg_list)
-#            pool.close()
-#            pool.join()
-        print(time.time()-start_s)
+            print('\nFeature extraction finished.')
+
+        print(
+            'Elapsed time: {:.2f} seconds'.format(
+                time.time() - start_s
+            )
+        )
+
+        if self._user_stop_requested:
+            print('\nFeature extraction stopped.')
+        else:
+            print('\nFeature extraction finished.')
 
     def preprocess_features(self, cfg_id=None):
         # Setting up folders and filenames
