@@ -55,7 +55,7 @@ def get_params(argv='1'):
 
         # RL adaptive feature-extraction params (PPO-based window/filterbank selector)
         use_rl_adaptive_feat=False,     # اگر True باشه، RLAdaptiveWrapper به‌جای backbone خام استفاده می‌شه
-        feat_win_configs=[10, 20, 40, 80],   # ms -- کاندیدهای طول پنجره STFT (باید با extraction هم‌خوان باشه)
+        feat_win_configs=[20, 40, 60, 80],   # ms -- همه >= hop_len (20ms) => overlap: 0%, 50%, 66%, 75%
         rl_hidden_dim=32,
         rl_lr=1e-3,
         jitter_penalty_coef=0.05,
