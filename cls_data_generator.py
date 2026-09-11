@@ -26,7 +26,7 @@ class DataGenerator(object):
 
         # --- RL multi-resolution support ---
         self._feat_win_configs = params.get('feat_win_configs', None)
-        self._multi_config_mode = bool(self._feat_win_configs)
+        self._multi_config_mode = bool(self._feat_win_configs) and params.get('use_rl_adaptive_feat', False)
         self._num_configs = len(self._feat_win_configs) if self._multi_config_mode else 1
         if self._multi_config_mode:
             self._feat_dirs = [self._feat_cls.get_normalized_feat_dir(cfg_id=c) for c in range(self._num_configs)]
